@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="500" viewBox="0 0 1920 500">
+  <!-- Dark gradient background -->
+  <defs>
+    <linearGradient id="gradientBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a1a;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0a0a0a;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="accentGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#dc3545;stop-opacity:0.3" />
+      <stop offset="100%" style="stop-color:#a71930;stop-opacity:0.3" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Background -->
+  <rect width="1920" height="500" fill="url(#gradientBg)"/>
+  
+  <!-- Accent stripes -->
+  <rect width="1920" height="10" y="480" fill="url(#accentGradient)"/>
+  
+  <!-- Pattern overlay -->
+  <rect width="1920" height="500" fill="none" stroke="rgba(220,53,69,0.05)" stroke-width="2" stroke-dasharray="100,50"/>
+  
+  <!-- Decorative elements -->
+  <circle cx="100" cy="100" r="80" fill="none" stroke="#dc3545" stroke-width="1" opacity="0.1"/>
+  <circle cx="1850" cy="450" r="120" fill="none" stroke="#dc3545" stroke-width="1" opacity="0.1"/>
+  <circle cx="960" cy="250" r="150" fill="none" stroke="#dc3545" stroke-width="1" opacity="0.05"/>
+  
+  <!-- Speedometer-like design on right -->
+  <g opacity="0.08" transform="translate(1700, 150)">
+    <circle cx="0" cy="0" r="100" fill="none" stroke="#dc3545" stroke-width="2"/>
+    <line x1="0" y1="-100" x2="0" y2="-85" stroke="#dc3545" stroke-width="2"/>
+    <line x1="70" y1="-70" x2="60" y2="-60" stroke="#dc3545" stroke-width="2"/>
+    <path d="M 0,0 L 70,-70" fill="none" stroke="#dc3545" stroke-width="2"/>
+  </g>
+</svg>

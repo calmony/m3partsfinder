@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+
+{% block title %}{{ category }} - BMW E9X M3 Parts Finder{% endblock %}
+
+{% block content %}
+<div style="margin-bottom: 30px;">
+    <h2 style="color: #1a1a2e; margin-bottom: 10px;">{{ category }} Parts</h2>
+    <p style="color: #666;">{{ items|length }} items in this category</p>
+</div>
+
+<div style="margin: 30px 0; padding: 20px; background: #f8f9fa; border-radius: 8px;">
+    <h4 style="margin-bottom: 15px; color: #1a1a2e;">Other Categories</h4>
+    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+    {% for cat in categories %}
+        {% if cat != category %}
+        <a href="/category/{{ cat.replace('/', '%2F') }}" style="text-decoration: none;">
+            <div style="background: white; padding: 10px 15px; border-radius: 6px; border: 1px solid #dee2e6; transition: all 0.3s ease;" 
+                 onmouseover="this.style.borderColor='#667eea'; this.style.backgroundColor='#f8f9ff';"
+                 onmouseout="this.style.borderColor='#dee2e6'; this.style.backgroundColor='white';">
+                <small style="color: #667eea;">{{ cat }}</small>
+                {% if cat_stats and cat_stats.get(cat) %}
+                    <span style="color: #999;"> ({{ cat_stats[cat] }})</span>
+                {% endif %}
+            </div>
+        </a>
+        {% endif %}
+    {% endfor %}
+    </div>
+</div>
+
+{% if items %}
+    <div class="items-grid">
+        {% for item in items %}
+            <div class="item-card">
+                {% if item.image %}
+                    <div class="item-image">
+                        <img src="{{ item.image }}" alt="{{ item.title }}" onerror="this.src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22300%22 height=%22200%22%3E%3Crect fill=%22%23f0f0f0%22 width=%22300%22 height=%22200%22/%3E%3Ctext fill=%22%23999%22 font-size=%2216%22 dy=%221em%22 x=%2250%25%22 y=%2250%25%22 text-anchor=%22middle%22%3ENo Image%3C/text%3E%3C/svg%3E'">
+                    </div>
+                {% else %}
+                    <div class="item-image" style="background: #f0f0f0; color: #999;">
+                        <span>No Image</span>
+                    </div>
+                {% endif %}
+                
+                <div class="item-content">
+                    <span class="item-source">{{ item.source }}</span>
+                    <h3 class="item-title">{{ item.title }}</h3>
+                    {% if item.price %}
+                        <div class="item-price">{{ item.price }}</div>
+                    {% endif %}
+                    <small style="color: #999;">
+                        {{ item.found_date }}
+                    </small>
+                    
+                    <div class="item-footer">
+                        <a href="{{ item.url }}" target="_blank" class="item-link">View on {{ item.source }}</a>
+                        <button class="item-archive" onclick="archiveItem({{ item.id }})">×</button>
+                    </div>
+                </div>
+            </div>
+        {% endfor %}
+    </div>
+    
+    {% if limit >= 20 %}
+        <div class="pagination">
+            {% if page > 1 %}
+                <a href="/category/{{ category.replace('/', '%2F') }}?page=1">« First</a>
+                <a href="/category/{{ category.replace('/', '%2F') }}?page={{ page - 1 }}">← Previous</a>
+            {% endif %}
+            <span class="current">Page {{ page }}</span>
+            {% if items|length == limit %}
+                <a href="/category/{{ category.replace('/', '%2F') }}?page={{ page + 1 }}">Next →</a>
+            {% endif %}
+        </div>
+    {% endif %}
+{% else %}
+    <div class="empty-state">
+        <h2>No parts in this category</h2>
+        <p>No {{ category|lower }} items found yet.</p>
+        <a href="/" style="color: #667eea; text-decoration: none; font-weight: 600; margin-top: 20px; display: inline-block;">← Back to All Parts</a>
+    </div>
+{% endif %}
+
+<script>
+function archiveItem(itemId) {
+    if (confirm('Archive this item?')) {
+        fetch(`/api/archive/${itemId}`, { method: 'POST' })
+            .then(r => r.json())
+            .then(d => {
+                if (d.status === 'ok') {
+                    location.reload();
+                }
+            });
+    }
+}
+</script>
+{% endblock %}

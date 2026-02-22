@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block title %}Stats - BMW E9X M3 Parts Finder{% endblock %}
+
+{% block content %}
+<div class="stats">
+    <div class="stat-card">
+        <h3>{{ stats.total_items }}</h3>
+        <p>Total Parts Found</p>
+    </div>
+    <div class="stat-card">
+        <h3>{{ stats.sources }}</h3>
+        <p>Active Sources</p>
+    </div>
+</div>
+
+<div style="margin-top: 40px; padding: 20px; background: #f8f9fa; border-radius: 8px;">
+    <h2 style="margin-bottom: 20px; color: #1a1a2e;">About the Agent</h2>
+    
+    <h3 style="color: #667eea; margin-top: 20px;">How it works</h3>
+    <ul style="margin-left: 20px; color: #333; line-height: 1.8;">
+        <li><strong>Continuous Monitoring:</strong> The agent searches eBay, forums, and marketplaces automatically</li>
+        <li><strong>Smart Deduplication:</strong> Each part is tracked by URL to prevent duplicate alerts</li>
+        <li><strong>Real-time Updates:</strong> New deals appear on this dashboard as they're discovered</li>
+        <li><strong>Multi-source:</strong> Results aggregated from eBay, e90post, m3cutters, bimmerpost, and more</li>
+    </ul>
+    
+    <h3 style="color: #667eea; margin-top: 20px;">Data Sources</h3>
+    <ul style="margin-left: 20px; color: #333; line-height: 1.8;">
+        <li><strong>eBay</strong> - Public listings searched by keyword</li>
+        <li><strong>e90post.com</strong> - BMW E90/E92 enthusiast forum</li>
+        <li><strong>m3cutters.com</strong> - M3-focused community</li>
+        <li><strong>bimmerpost.com</strong> - General BMW parts discussions</li>
+    </ul>
+    
+    <h3 style="color: #667eea; margin-top: 20px;">Navigation</h3>
+    <ul style="margin-left: 20px; color: #333; line-height: 1.8;">
+        <li><strong>All Parts:</strong> Browse complete inventory of discovered deals</li>
+        <li><strong>Last 24h:</strong> Filter to show only recent finds</li>
+        <li><strong>Search:</strong> Look for specific parts by name</li>
+    </ul>
+    
+    <h3 style="color: #667eea; margin-top: 20px;">Tips</h3>
+    <ul style="margin-left: 20px; color: #333; line-height: 1.8;">
+        <li>Archive items you're not interested in with the × button</li>
+        <li>Check multiple sources for the best price</li>
+        <li>Use the search box to find specific parts quickly</li>
+        <li>Check the "Last 24h" view to see the hottest new deals</li>
+    </ul>
+</div>
+{% endblock %}
