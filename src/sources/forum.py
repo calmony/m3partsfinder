@@ -64,81 +64,291 @@ M3POST_CATEGORIES = {
 def categorize_by_forum_structure(title: str) -> str:
     """Categorize based on M3Post forum structure."""
     title_lower = title.lower()
-    
+
     for keyword, category in M3POST_CATEGORIES.items():
         if keyword in title_lower:
             return category
-    
+
     return "Other"
 
-def search_m3post(keyword: str, headers: dict = None, max_results: int = 20) -> List[Dict]:
-    """Search M3Post forum (vBulletin) using search endpoint."""
-    if not headers:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-    
-    items = []
+
+# Browser-like headers for forum requests (forums block bot user agents)
+_BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
+
+def _normalize_thread_url(url: str) -> str:
+    """Normalize a vBulletin thread URL for deduplication.
+
+    Strips page numbers, post anchors, and highlight params so that
+    different links to the same thread resolve to one canonical URL.
+
+    Args:
+        url: Raw thread URL.
+
+    Returns:
+        Canonical URL string.
+    """
+    # Extract thread ID from showthread.php?t=XXXXX or showthread.php?p=XXXXX
+    thread_match = re.search(r'showthread\.php\?t=(\d+)', url)
+    if thread_match:
+        base = url.split('/forums/')[0] if '/forums/' in url else 'https://www.m3post.com'
+        return f"{base}/forums/showthread.php?t={thread_match.group(1)}"
+    return url.split('#')[0].split('&highlight=')[0]
+
+
+# Module-level cache so multiple keyword searches reuse the same listing
+_m3post_listing_cache: Dict = {
+    'threads': [],
+    'timestamp': 0.0,
+}
+
+_M3POST_CACHE_TTL = 300  # seconds
+
+
+def _fetch_m3post_listing_page(page_num: int, headers: dict) -> List[Dict]:
+    """Fetch one page of the M3Post FS/FT forum listing.
+
+    Args:
+        page_num: 1-based page number.
+        headers: HTTP headers for the request.
+
+    Returns:
+        List of dicts with 'title' and 'url' keys.
+    """
     base = "https://www.m3post.com"
-    
-    # Use forum search endpoint with query parameters
-    # vBulletin search: /forums/search.php?query=KEYWORD&forumchoice=182&searchdate=7&resultorder=lastpost
-    url = f"{base}/forums/search.php?query={keyword}&forumchoice=182&searchdate=7&resultorder=lastpost"
-    
+    url = f"{base}/forums/forumdisplay.php?f=182&order=desc&page={page_num}"
+    threads: List[Dict] = []
+
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
-        
-        # Find all search result links (vBulletin uses <a> tags with href containing 'showthread.php' or 'showpost.php')
-        result_links = soup.find_all('a', href=lambda x: x and ('showthread.php' in x or 'showpost.php' in x))
-        
-        for link in result_links:
+
+        # vBulletin 3.x: thread title links have id="thread_title_XXXX"
+        thread_links = soup.find_all(
+            'a', id=lambda x: x and x.startswith('thread_title_')
+        )
+
+        if not thread_links:
+            # Fallback: links inside the threads table
+            thread_links = soup.select('#threadslist a[href*="showthread.php"]')
+
+        if not thread_links:
+            # Broadest fallback
+            thread_links = soup.find_all(
+                'a', href=lambda x: x and 'showthread.php' in x
+            )
+
+        seen_urls: set = set()
+        for link in thread_links:
             title = link.get_text(strip=True)
-            
-            # Skip empty titles, navigation links, or pagination
-            if not title or len(title) < 3 or title in ['«', '»', 'Previous', 'Next']:
+            if not title or len(title) < 5:
                 continue
-            
-            # Get thread URL and make absolute
-            thread_url = link.get("href", "")
-            if thread_url:
-                if not thread_url.startswith("http"):
-                    if thread_url.startswith("/"):
-                        thread_url = base + thread_url
+            if title in ('«', '»', 'Previous', 'Next', 'First', 'Last'):
+                continue
+
+            raw_url = link.get('href', '')
+            if not raw_url:
+                continue
+
+            # Make absolute
+            if not raw_url.startswith('http'):
+                if raw_url.startswith('/'):
+                    raw_url = base + raw_url
+                else:
+                    raw_url = base + '/forums/' + raw_url
+
+            canonical = _normalize_thread_url(raw_url)
+            if canonical in seen_urls:
+                continue
+            seen_urls.add(canonical)
+
+            threads.append({'title': title, 'url': canonical})
+
+    except Exception as e:
+        logger.warning(f"Failed to fetch M3Post listing page {page_num}: {e}")
+
+    return threads
+
+
+def _get_m3post_threads(headers: dict, pages: int = 3) -> List[Dict]:
+    """Return M3Post forum threads, using a short-lived cache.
+
+    Args:
+        headers: HTTP headers.
+        pages: Number of listing pages to scrape.
+
+    Returns:
+        List of thread dicts with 'title' and 'url' keys.
+    """
+    now = time.time()
+    cache = _m3post_listing_cache
+
+    if cache['threads'] and (now - cache['timestamp']) < _M3POST_CACHE_TTL:
+        logger.debug("Using cached M3Post threads (%d threads)", len(cache['threads']))
+        return cache['threads']
+
+    all_threads: List[Dict] = []
+    seen_urls: set = set()
+
+    for page_num in range(1, pages + 1):
+        page_threads = _fetch_m3post_listing_page(page_num, headers)
+        for t in page_threads:
+            if t['url'] not in seen_urls:
+                seen_urls.add(t['url'])
+                all_threads.append(t)
+        logger.debug("M3Post page %d: %d threads", page_num, len(page_threads))
+
+        if not page_threads:
+            break
+        if page_num < pages:
+            time.sleep(0.5)
+
+    cache['threads'] = all_threads
+    cache['timestamp'] = now
+    logger.info("Cached %d M3Post threads from %d pages", len(all_threads), pages)
+    return all_threads
+
+
+def search_m3post(keyword: str, headers: dict = None, max_results: int = 20) -> List[Dict]:
+    """Search M3Post forum by scraping the FS/FT listing and filtering by keyword.
+
+    Uses the forum listing page (forumdisplay.php) instead of the search
+    endpoint, which is more reliable and avoids vBulletin search
+    session/cookie requirements.
+
+    Args:
+        keyword: Search term to match in thread titles.
+        headers: HTTP headers (a browser-like UA is always used for forums).
+        max_results: Maximum number of results to return.
+
+    Returns:
+        List of item dicts ready for database insertion.
+    """
+    # Always use browser-like headers for forum requests
+    req_headers = dict(_BROWSER_HEADERS)
+    if headers:
+        # Keep any extra headers but override User-Agent
+        for k, v in headers.items():
+            if k.lower() != 'user-agent':
+                req_headers[k] = v
+
+    items: List[Dict] = []
+    base = "https://www.m3post.com"
+
+    # --- Strategy 1: Scrape forum listing pages and filter by keyword ---
+    all_threads = _get_m3post_threads(req_headers, pages=3)
+    keyword_lower = keyword.lower()
+
+    matching_threads = [
+        t for t in all_threads
+        if keyword_lower in t['title'].lower()
+    ]
+    logger.info(
+        "M3Post: %d/%d threads match keyword '%s'",
+        len(matching_threads), len(all_threads), keyword,
+    )
+
+    seen_urls: set = set()
+    for thread in matching_threads:
+        if len(items) >= max_results:
+            break
+
+        canonical = _normalize_thread_url(thread['url'])
+        if canonical in seen_urls:
+            continue
+        seen_urls.add(canonical)
+
+        # Fetch thread page for price + image
+        thread_details = extract_thread_details(canonical, headers=req_headers)
+
+        price = (
+            extract_price(thread['title'])
+            or thread_details.get("price")
+            or "Contact"
+        )
+        category = categorize_by_forum_structure(thread['title'] + " " + keyword)
+
+        items.append({
+            "source": "forum:m3post",
+            "title": thread['title'],
+            "price": price,
+            "url": canonical,
+            "image": thread_details.get("image"),
+            "keyword": keyword,
+            "category": category,
+        })
+
+        time.sleep(0.3)
+
+    # --- Strategy 2: Fall back to search.php if listing produced nothing ---
+    if not items:
+        logger.debug("M3Post listing returned 0 matches for '%s', trying search", keyword)
+        search_url = (
+            f"{base}/forums/search.php?query={keyword}"
+            f"&forumchoice=182&searchdate=7&resultorder=lastpost"
+        )
+        try:
+            resp = requests.get(search_url, headers=req_headers, timeout=15)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            result_links = soup.find_all(
+                'a', href=lambda x: x and 'showthread.php' in x
+            )
+
+            for link in result_links:
+                if len(items) >= max_results:
+                    break
+
+                title = link.get_text(strip=True)
+                if not title or len(title) < 5:
+                    continue
+                if title in ('«', '»', 'Previous', 'Next', 'First', 'Last'):
+                    continue
+
+                raw_url = link.get("href", "")
+                if not raw_url:
+                    continue
+                if not raw_url.startswith("http"):
+                    if raw_url.startswith("/"):
+                        raw_url = base + raw_url
                     else:
-                        # Relative URL needs forums/ prefix
-                        thread_url = base + "/forums/" + thread_url
-                
-                # Extract details from thread (price + image)
-                thread_details = extract_thread_details(thread_url, headers=headers)
-                
-                # Try to extract price from title first, then from thread content
-                price = extract_price(title) or thread_details.get("price") or "Contact"
-                
-                # Categorize based on title and keyword
+                        raw_url = base + "/forums/" + raw_url
+
+                canonical = _normalize_thread_url(raw_url)
+                if canonical in seen_urls:
+                    continue
+                seen_urls.add(canonical)
+
+                thread_details = extract_thread_details(canonical, headers=req_headers)
+                price = (
+                    extract_price(title)
+                    or thread_details.get("price")
+                    or "Contact"
+                )
                 category = categorize_by_forum_structure(title + " " + keyword)
-                
+
                 items.append({
                     "source": "forum:m3post",
                     "title": title,
                     "price": price,
-                    "url": thread_url,
+                    "url": canonical,
                     "image": thread_details.get("image"),
                     "keyword": keyword,
                     "category": category,
                 })
-                
-                # Rate limit to avoid hammering forum
+
                 time.sleep(0.3)
-            
-            if len(items) >= max_results:
-                break
-    
-    except Exception as e:
-        logger.debug(f"M3Post search error: {e}")
-    
+
+        except Exception as e:
+            logger.debug("M3Post search fallback error: %s", e)
+
     return items
 
 
@@ -202,68 +412,126 @@ def search_generic_forum(forum: dict, keyword: str, headers: dict = None, max_re
 
 
 def extract_price(text: str) -> str:
-    """Extract price from text like '$1,500', '1500 USD', etc."""
-    # Look for $XXX, $X,XXX, €XXX patterns
+    """Extract price from text like '$1,500', '1500 USD', 'asking 1500', etc.
+
+    Args:
+        text: Text to search for price patterns.
+
+    Returns:
+        Price string or None if no price found.
+    """
+    # Pattern 1: $XXX or €XXX with optional cents
     match = re.search(r'[$€][\d,]+(?:\.\d{2})?', text)
     if match:
         return match.group(0)
+
+    # Pattern 2: "1500 USD", "1500 obo", "asking 1500", "price 1500"
+    match = re.search(
+        r'(?:asking|price|obo|shipped)\s*:?\s*(\d[\d,]*)',
+        text, re.IGNORECASE,
+    )
+    if match:
+        return f"${match.group(1)}"
+
+    # Pattern 3: number followed by price-related word
+    match = re.search(r'(\d[\d,]+)\s*(?:USD|obo|shipped|firm)', text, re.IGNORECASE)
+    if match:
+        return f"${match.group(1)}"
+
     return None
 
 
 def extract_thread_details(thread_url: str, headers: dict = None) -> Dict:
-    """Fetch thread and extract price + first image from post content.
-    
-    Returns dict with 'price' and 'image' keys.
+    """Fetch a thread page and extract the first price and image from post content.
+
+    Looks inside the first post's content area (vBulletin ``post_message_*``
+    div or ``alt1`` cell) so that navigation chrome, avatars, and other UI
+    images are ignored.
+
+    Args:
+        thread_url: Full URL of the thread.
+        headers: HTTP headers for the request.
+
+    Returns:
+        Dict with 'price' (str|None) and 'image' (str|None) keys.
     """
     if not headers:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-    
-    result = {"price": None, "image": None}
-    
+        headers = dict(_BROWSER_HEADERS)
+
+    result: Dict = {"price": None, "image": None}
+
     try:
         resp = requests.get(thread_url, headers=headers, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
-        
-        # Search all text for prices (more robust than div selectors)
-        all_text = soup.get_text()
-        prices = re.findall(r'\$[\d,]+(?:\.\d{2})?', all_text)
-        if prices:
-            result["price"] = prices[0]  # Take first price found
-        
-        # Find first relevant image in thread
-        imgs = soup.find_all('img')
+
+        # --- Price extraction ---
+        # Look in the first post content div for prices
+        first_post = (
+            soup.find('div', id=lambda x: x and x.startswith('post_message_'))
+            or soup.find('div', class_='postcontent')
+            or soup.find('blockquote', class_='postcontent')
+        )
+        price_text = first_post.get_text() if first_post else soup.get_text()
+        price = extract_price(price_text)
+        if price:
+            result["price"] = price
+
+        # --- Image extraction ---
+        # Narrow the search to the first post content area when possible
+        search_area = first_post if first_post else soup
+
+        # vBulletin UI patterns to skip (icons, smilies, status indicators, etc.)
+        skip_patterns = [
+            'banner', 'icon', 'logo', 'nav', 'avatar',
+            '1x1', 'spacer', 'button', 'pixel',
+            'smilie', 'smiley', 'emoji', 'emoticon',
+            'statusicon', 'inlinemod', 'reputation',
+            'clear.gif', '/misc/', '/buttons/',
+            '/icons/', 'progress_bar', 'rank',
+            'forum_old', 'collapse_', 'postcount',
+            'vbulletin_css', '/images/ranks/',
+        ]
+
+        imgs = search_area.find_all('img')
         for img in imgs:
             src = img.get('src', '') or img.get('data-src', '')
             if not src:
                 continue
-                
-            # Skip banners, icons, and forum UI elements
-            skip_patterns = ['banner', 'icon', 'logo', 'nav', 'avatar', '1x1', 'spacer', 'button', 'pixel']
-            if any(pattern in src.lower() for pattern in skip_patterns):
+
+            src_lower = src.lower()
+
+            # Skip known UI / tiny images
+            if any(p in src_lower for p in skip_patterns):
                 continue
-            
-            # Prefer uploaded/attachment images
-            if any(pattern in src.lower() for pattern in ['attachment', 'imgix', 'image', 'photo', 'upload', 'user']):
-                # Make absolute URL if needed
-                if src.startswith('//'):
-                    src = 'https:' + src
-                elif src.startswith('/'):
-                    base_url = thread_url.split('/forums/')[0]
-                    src = base_url + src
-                elif not src.startswith('http'):
-                    base_url = '/'.join(thread_url.split('/')[:3])
-                    src = base_url + '/' + src
-                
-                result["image"] = src
-                break
-    
+
+            # Skip images with very small dimensions
+            try:
+                w = img.get('width', '')
+                h = img.get('height', '')
+                if w and int(str(w).replace('px', '')) < 50:
+                    continue
+                if h and int(str(h).replace('px', '')) < 50:
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+            # Make absolute URL
+            if src.startswith('//'):
+                src = 'https:' + src
+            elif src.startswith('/'):
+                base_url = '/'.join(thread_url.split('/')[:3])
+                src = base_url + src
+            elif not src.startswith('http'):
+                base_url = '/'.join(thread_url.split('/')[:3])
+                src = base_url + '/' + src
+
+            result["image"] = src
+            break
+
     except Exception as e:
-        logger.debug(f"Failed to extract thread details from {thread_url}: {e}")
-    
+        logger.debug("Failed to extract thread details from %s: %s", thread_url, e)
+
     return result
 
 
