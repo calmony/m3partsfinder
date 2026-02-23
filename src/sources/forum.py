@@ -12,12 +12,6 @@ logger = logging.getLogger(__name__)
 # Popular E9x/M3 forum targets
 FORUMS = [
     {
-        "name": "m3post",
-        "base_url": "https://www.m3post.com",
-        "forum_id": 182,  # E9x M3 parts/sales section
-        "type": "vbulletin",
-    },
-    {
         "name": "e90post",
         "base_url": "https://www.e90post.com",
         "search_endpoint": "/forums/search/",
@@ -35,6 +29,13 @@ FORUMS = [
         "search_endpoint": "/forums/search/",
         "type": "generic",
     },
+]
+
+# M3Post forum sections to scrape (grab all threads, no keyword filtering).
+# Each section has a forum ID and a default category for items found there.
+M3POST_SECTIONS = [
+    {"forum_id": 277, "category": "Wheels", "label": "Wheels"},
+    {"forum_id": 182, "category": None, "label": "E9x M3 Parts"},
 ]
 
 # M3Post forum categories (from their site structure)
@@ -101,27 +102,25 @@ def _normalize_thread_url(url: str) -> str:
     return url.split('#')[0].split('&highlight=')[0]
 
 
-# Module-level cache so multiple keyword searches reuse the same listing
-_m3post_listing_cache: Dict = {
-    'threads': [],
-    'timestamp': 0.0,
-}
+# Module-level cache keyed by forum_id so each section is cached independently
+_m3post_listing_cache: Dict[int, Dict] = {}
 
 _M3POST_CACHE_TTL = 300  # seconds
 
 
-def _fetch_m3post_listing_page(page_num: int, headers: dict) -> List[Dict]:
-    """Fetch one page of the M3Post FS/FT forum listing.
+def _fetch_m3post_listing_page(page_num: int, headers: dict, forum_id: int = 182) -> List[Dict]:
+    """Fetch one page of an M3Post forum listing.
 
     Args:
         page_num: 1-based page number.
         headers: HTTP headers for the request.
+        forum_id: vBulletin forum ID to scrape.
 
     Returns:
         List of dicts with 'title' and 'url' keys.
     """
     base = "https://www.m3post.com"
-    url = f"{base}/forums/forumdisplay.php?f=182&order=desc&page={page_num}"
+    url = f"{base}/forums/forumdisplay.php?f={forum_id}&order=desc&page={page_num}"
     threads: List[Dict] = []
 
     try:
@@ -176,179 +175,113 @@ def _fetch_m3post_listing_page(page_num: int, headers: dict) -> List[Dict]:
     return threads
 
 
-def _get_m3post_threads(headers: dict, pages: int = 3) -> List[Dict]:
-    """Return M3Post forum threads, using a short-lived cache.
+def _get_m3post_threads(headers: dict, forum_id: int = 182, pages: int = 3) -> List[Dict]:
+    """Return M3Post forum threads for a given section, using a short-lived cache.
 
     Args:
         headers: HTTP headers.
+        forum_id: vBulletin forum ID to scrape.
         pages: Number of listing pages to scrape.
 
     Returns:
         List of thread dicts with 'title' and 'url' keys.
     """
     now = time.time()
-    cache = _m3post_listing_cache
 
-    if cache['threads'] and (now - cache['timestamp']) < _M3POST_CACHE_TTL:
-        logger.debug("Using cached M3Post threads (%d threads)", len(cache['threads']))
-        return cache['threads']
+    if forum_id in _m3post_listing_cache:
+        cache = _m3post_listing_cache[forum_id]
+        if cache['threads'] and (now - cache['timestamp']) < _M3POST_CACHE_TTL:
+            logger.debug("Using cached M3Post f=%d threads (%d)", forum_id, len(cache['threads']))
+            return cache['threads']
 
     all_threads: List[Dict] = []
     seen_urls: set = set()
 
     for page_num in range(1, pages + 1):
-        page_threads = _fetch_m3post_listing_page(page_num, headers)
+        page_threads = _fetch_m3post_listing_page(page_num, headers, forum_id=forum_id)
         for t in page_threads:
             if t['url'] not in seen_urls:
                 seen_urls.add(t['url'])
                 all_threads.append(t)
-        logger.debug("M3Post page %d: %d threads", page_num, len(page_threads))
+        logger.debug("M3Post f=%d page %d: %d threads", forum_id, page_num, len(page_threads))
 
         if not page_threads:
             break
         if page_num < pages:
             time.sleep(0.5)
 
-    cache['threads'] = all_threads
-    cache['timestamp'] = now
-    logger.info("Cached %d M3Post threads from %d pages", len(all_threads), pages)
+    _m3post_listing_cache[forum_id] = {'threads': all_threads, 'timestamp': now}
+    logger.info("Cached %d M3Post threads from f=%d (%d pages)", len(all_threads), forum_id, pages)
     return all_threads
 
 
-def search_m3post(keyword: str, headers: dict = None, max_results: int = 20) -> List[Dict]:
-    """Search M3Post forum by scraping the FS/FT listing and filtering by keyword.
+def scrape_m3post_sections(headers: dict = None, pages: int = 3) -> List[Dict]:
+    """Scrape all threads from configured M3Post forum sections.
 
-    Uses the forum listing page (forumdisplay.php) instead of the search
-    endpoint, which is more reliable and avoids vBulletin search
-    session/cookie requirements.
+    Grabs everything from the first N pages of each section — no keyword
+    filtering.  Posts without a detectable price are skipped.  The Wheels
+    section (f=277) gets a forced "Wheels" category; other sections fall
+    back to title-based categorisation.
 
     Args:
-        keyword: Search term to match in thread titles.
-        headers: HTTP headers (a browser-like UA is always used for forums).
-        max_results: Maximum number of results to return.
+        headers: HTTP headers (browser-like UA is always used).
+        pages: Number of listing pages to fetch per section.
 
     Returns:
         List of item dicts ready for database insertion.
     """
-    # Always use browser-like headers for forum requests
     req_headers = dict(_BROWSER_HEADERS)
     if headers:
-        # Keep any extra headers but override User-Agent
         for k, v in headers.items():
             if k.lower() != 'user-agent':
                 req_headers[k] = v
 
     items: List[Dict] = []
-    base = "https://www.m3post.com"
-
-    # --- Strategy 1: Scrape forum listing pages and filter by keyword ---
-    all_threads = _get_m3post_threads(req_headers, pages=3)
-    keyword_lower = keyword.lower()
-
-    matching_threads = [
-        t for t in all_threads
-        if keyword_lower in t['title'].lower()
-    ]
-    logger.info(
-        "M3Post: %d/%d threads match keyword '%s'",
-        len(matching_threads), len(all_threads), keyword,
-    )
-
     seen_urls: set = set()
-    for thread in matching_threads:
-        if len(items) >= max_results:
-            break
 
-        canonical = _normalize_thread_url(thread['url'])
-        if canonical in seen_urls:
-            continue
-        seen_urls.add(canonical)
+    for section in M3POST_SECTIONS:
+        forum_id = section["forum_id"]
+        forced_category = section.get("category")
+        label = section.get("label", str(forum_id))
 
-        # Fetch thread page for price + image
-        thread_details = extract_thread_details(canonical, headers=req_headers)
+        threads = _get_m3post_threads(req_headers, forum_id=forum_id, pages=pages)
+        logger.info("M3Post [%s] (f=%d): %d threads from %d pages",
+                     label, forum_id, len(threads), pages)
 
-        price = (
-            extract_price(thread['title'])
-            or thread_details.get("price")
-            or "Contact"
-        )
-        category = categorize_by_forum_structure(thread['title'] + " " + keyword)
+        for thread in threads:
+            canonical = _normalize_thread_url(thread['url'])
+            if canonical in seen_urls:
+                continue
+            seen_urls.add(canonical)
 
-        items.append({
-            "source": "forum:m3post",
-            "title": thread['title'],
-            "price": price,
-            "url": canonical,
-            "image": thread_details.get("image"),
-            "keyword": keyword,
-            "category": category,
-        })
+            # Fetch thread page for price + image
+            thread_details = extract_thread_details(canonical, headers=req_headers)
 
-        time.sleep(0.3)
-
-    # --- Strategy 2: Fall back to search.php if listing produced nothing ---
-    if not items:
-        logger.debug("M3Post listing returned 0 matches for '%s', trying search", keyword)
-        search_url = (
-            f"{base}/forums/search.php?query={keyword}"
-            f"&forumchoice=182&searchdate=7&resultorder=lastpost"
-        )
-        try:
-            resp = requests.get(search_url, headers=req_headers, timeout=15)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "lxml")
-
-            result_links = soup.find_all(
-                'a', href=lambda x: x and 'showthread.php' in x
+            price = (
+                extract_price(thread['title'])
+                or thread_details.get("price")
             )
 
-            for link in result_links:
-                if len(items) >= max_results:
-                    break
+            # Skip posts without a price
+            if not price:
+                logger.debug("Skipping (no price): %s", thread['title'])
+                continue
 
-                title = link.get_text(strip=True)
-                if not title or len(title) < 5:
-                    continue
-                if title in ('«', '»', 'Previous', 'Next', 'First', 'Last'):
-                    continue
+            category = forced_category or categorize_by_forum_structure(thread['title'])
 
-                raw_url = link.get("href", "")
-                if not raw_url:
-                    continue
-                if not raw_url.startswith("http"):
-                    if raw_url.startswith("/"):
-                        raw_url = base + raw_url
-                    else:
-                        raw_url = base + "/forums/" + raw_url
+            items.append({
+                "source": "forum:m3post",
+                "title": thread['title'],
+                "price": price,
+                "url": canonical,
+                "image": thread_details.get("image"),
+                "keyword": label,
+                "category": category,
+            })
 
-                canonical = _normalize_thread_url(raw_url)
-                if canonical in seen_urls:
-                    continue
-                seen_urls.add(canonical)
+            time.sleep(0.3)
 
-                thread_details = extract_thread_details(canonical, headers=req_headers)
-                price = (
-                    extract_price(title)
-                    or thread_details.get("price")
-                    or "Contact"
-                )
-                category = categorize_by_forum_structure(title + " " + keyword)
-
-                items.append({
-                    "source": "forum:m3post",
-                    "title": title,
-                    "price": price,
-                    "url": canonical,
-                    "image": thread_details.get("image"),
-                    "keyword": keyword,
-                    "category": category,
-                })
-
-                time.sleep(0.3)
-
-        except Exception as e:
-            logger.debug("M3Post search fallback error: %s", e)
-
+    logger.info("M3Post sections total: %d items with prices", len(items))
     return items
 
 
@@ -478,7 +411,8 @@ def extract_thread_details(thread_url: str, headers: dict = None) -> Dict:
             result["price"] = price
 
         # --- Image extraction ---
-        # Narrow the search to the first post content area when possible
+        # Narrow the search to the first post content area when possible.
+        # Also look in the attachment section below the post.
         search_area = first_post if first_post else soup
 
         # vBulletin UI patterns to skip (icons, smilies, status indicators, etc.)
@@ -493,41 +427,75 @@ def extract_thread_details(thread_url: str, headers: dict = None) -> Dict:
             'vbulletin_css', '/images/ranks/',
         ]
 
-        imgs = search_area.find_all('img')
-        for img in imgs:
-            src = img.get('src', '') or img.get('data-src', '')
+        base_url = '/'.join(thread_url.split('/')[:3])
+
+        def _make_absolute(src: str) -> str:
+            if src.startswith('//'):
+                return 'https:' + src
+            if src.startswith('/'):
+                return base_url + src
+            if not src.startswith('http'):
+                return base_url + '/' + src
+            return src
+
+        def _is_content_image(img_tag) -> bool:
+            """Return True if the img tag looks like real post content."""
+            src = img_tag.get('src', '') or img_tag.get('data-src', '')
             if not src:
-                continue
-
+                return False
             src_lower = src.lower()
-
-            # Skip known UI / tiny images
             if any(p in src_lower for p in skip_patterns):
-                continue
-
-            # Skip images with very small dimensions
+                return False
             try:
-                w = img.get('width', '')
-                h = img.get('height', '')
+                w = img_tag.get('width', '')
+                h = img_tag.get('height', '')
                 if w and int(str(w).replace('px', '')) < 50:
-                    continue
+                    return False
                 if h and int(str(h).replace('px', '')) < 50:
-                    continue
+                    return False
             except (ValueError, TypeError):
                 pass
+            return True
 
-            # Make absolute URL
-            if src.startswith('//'):
-                src = 'https:' + src
-            elif src.startswith('/'):
-                base_url = '/'.join(thread_url.split('/')[:3])
-                src = base_url + src
-            elif not src.startswith('http'):
-                base_url = '/'.join(thread_url.split('/')[:3])
-                src = base_url + '/' + src
+        # Strategy 1: vBulletin attachment images (attachment.php)
+        # These are the "attached images" at the bottom of forum posts
+        attachment_imgs = soup.find_all(
+            'img', src=lambda x: x and 'attachment.php' in x
+        )
+        if not attachment_imgs:
+            # Also check data-src for lazy-loaded attachments
+            attachment_imgs = soup.find_all(
+                'img', attrs={'data-src': lambda x: x and 'attachment.php' in str(x)}
+            )
+        for img in attachment_imgs:
+            src = img.get('src', '') or img.get('data-src', '')
+            if src and _is_content_image(img):
+                result["image"] = _make_absolute(src)
+                break
 
-            result["image"] = src
-            break
+        # Strategy 2: Images inside the post content area
+        if not result["image"]:
+            imgs = search_area.find_all('img')
+            for img in imgs:
+                if _is_content_image(img):
+                    src = img.get('src', '') or img.get('data-src', '')
+                    result["image"] = _make_absolute(src)
+                    break
+
+        # Strategy 3: Linked attachment thumbnails (a > img pattern)
+        if not result["image"]:
+            attachment_links = soup.find_all(
+                'a', href=lambda x: x and 'attachment.php' in x
+            )
+            for link in attachment_links:
+                thumb = link.find('img')
+                if thumb:
+                    src = thumb.get('src', '') or thumb.get('data-src', '')
+                    if src:
+                        # Use the full-size attachment URL from the link href
+                        full_src = link.get('href', '')
+                        result["image"] = _make_absolute(full_src or src)
+                        break
 
     except Exception as e:
         logger.debug("Failed to extract thread details from %s: %s", thread_url, e)
@@ -536,11 +504,12 @@ def extract_thread_details(thread_url: str, headers: dict = None) -> Dict:
 
 
 def search_forum(forum: dict, keyword: str, headers: dict = None, max_results: int = 10) -> List[Dict]:
-    """Search a single forum by type."""
-    if forum.get("type") == "vbulletin" and forum.get("name") == "m3post":
-        return search_m3post(keyword, headers=headers, max_results=max_results)
-    else:
-        return search_generic_forum(forum, keyword, headers=headers, max_results=max_results)
+    """Search a single forum by type.
+
+    Note: M3Post is no longer searched by keyword here — use
+    ``scrape_m3post_sections()`` instead, which grabs all threads.
+    """
+    return search_generic_forum(forum, keyword, headers=headers, max_results=max_results)
 
 
 def search_forums(keyword: str, headers: dict = None, max_results: int = 20) -> List[Dict]:

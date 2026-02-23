@@ -7,7 +7,7 @@ from typing import List, Dict
 import schedule
 import time
 
-from src.sources import search_ebay, search_forums, search_facebook
+from src.sources import search_ebay, search_forums, search_facebook, scrape_m3post_sections
 from src.cache import Cache
 from src.notifiers import SMSNotifier, StdoutNotifier
 from src import db
@@ -57,14 +57,25 @@ class Agent:
         """Search all configured sources."""
         results = []
         keywords = self.config.get("parts", [])
-        
+
+        # --- M3Post: scrape all threads from configured forum sections ---
+        # This runs once per cycle (not per keyword) and grabs everything,
+        # skipping posts without a price.
+        try:
+            m3post_results = scrape_m3post_sections(headers=self.headers)
+            results.extend(m3post_results)
+            logger.info(f"M3Post sections: {len(m3post_results)} results")
+        except Exception as e:
+            logger.error(f"M3Post section scrape failed: {e}")
+
         if not keywords:
             logger.warning("No parts configured in config.yaml")
             return results
-        
+
+        # --- Keyword-based searches (eBay, other forums, Facebook) ---
         for keyword in keywords:
             logger.info(f"Searching for: {keyword}")
-            
+
             # eBay
             try:
                 ebay_results = search_ebay(keyword, headers=self.headers)
@@ -72,15 +83,15 @@ class Agent:
                 logger.info(f"  eBay: {len(ebay_results)} results")
             except Exception as e:
                 logger.error(f"  eBay search failed: {e}")
-            
-            # Forums
+
+            # Other forums (e90post, m3cutters, bimmerpost — m3post handled above)
             try:
                 forum_results = search_forums(keyword, headers=self.headers)
                 results.extend(forum_results)
                 logger.info(f"  Forums: {len(forum_results)} results")
             except Exception as e:
                 logger.error(f"  Forum search failed: {e}")
-            
+
             # Facebook (placeholder)
             try:
                 fb_results = search_facebook(keyword, headers=self.headers)
@@ -88,7 +99,7 @@ class Agent:
                 logger.info(f"  Facebook: {len(fb_results)} results")
             except Exception as e:
                 logger.error(f"  Facebook search failed: {e}")
-        
+
         return results
 
     def run_once(self):
